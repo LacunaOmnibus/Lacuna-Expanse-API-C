@@ -27,8 +27,8 @@ has 'ua' => (
 
 has 'session_id'     => ( is => 'rw' );
 has 'api_call_count' => ( is => 'rw', isa => 'Int', default => 0 );
-has 'user'           => ( is => 'rw', isa => 'Str', default => 'empty space' );
-has 'passwd'         => ( is => 'rw', isa => 'Str', default => 'fu2bar' );
+has 'user'           => ( is => 'rw', isa => 'Str', default => 'pink noise' );
+has 'passwd'         => ( is => 'rw', isa => 'Str', default => 'fixme' );
 
 has 'api_key' => (
     is      => 'rw',
