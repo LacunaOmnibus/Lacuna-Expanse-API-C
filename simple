@@ -1,0 +1,335 @@
+#!/usr/bin/env perl
+
+##################################################
+package Lacuna::Expanse::API;
+use Moose;
+use MooseX::Aliases;
+use JSON::RPC::Common;
+use JSON::RPC::Common::Marshal::HTTP;
+use LWP::UserAgent;
+use YAML;
+use Modern::Perl;
+use Carp 'croak';
+
+has 'url' => (
+    is      => 'ro',
+    isa     => 'URI',
+    default => sub { URI->new('https://us1.lacunaexpanse.com/') },
+    alias   => 'uri',
+);
+
+has 'ua' => (
+    is      => 'ro',
+    isa     => 'LWP::UserAgent',
+    default => sub { LWP::UserAgent->new; },
+    lazy    => 1,
+);
+
+has 'session_id'     => ( is => 'rw' );
+has 'api_call_count' => ( is => 'rw', isa => 'Int', default => 0 );
+has 'user'           => ( is => 'rw', isa => 'Str', default => 'empty space' );
+has 'passwd'         => ( is => 'rw', isa => 'Str', default => 'fu2bar' );
+
+has 'api_key' => (
+    is      => 'rw',
+    default => 'a634701a-4382-4c72-9c92-ece621efd1cb',
+);
+
+has 'module' => (
+    is => 'rw',
+    isa => 'Str',
+    default => 'empire',
+);
+
+#
+# handle the acutal RPC mechanics
+#
+sub rpc {
+    my $s      = shift;
+    my $method = shift;
+    my $params = ref $_[0] ? $_[0] : [@_];  # permit either ref or listed params
+
+    unshift(@$params, $s->session_id) if (defined $s->session_id);
+    # I've broken out all the parts for the request for debugging purposes.
+    my $m = JSON::RPC::Common::Marshal::HTTP->new();
+
+    my $json = JSON::RPC::Common::Procedure::Call->inflate(
+        jsonrpc => "2.0",
+        id      => '1',
+        method  => $method,
+        params  => $params,
+    );
+
+    my $u = $s->url;
+    $u->path( $s->module );
+
+    my $req = $m->call_to_request( $json, uri => $u, );
+    my $resp = $s->ua->request($req);
+    my $res = $m->response_to_result($resp);
+
+    if ( $res->error ) {
+        croak(
+            "RPC error (" . $res->error->code . "): " . $res->error->message );
+    }
+
+    my $r = $res->deflate;
+    return bless $r->{result}, 'Lacuna::Expanse::API::Results';
+}
+
+# Count the number of RPC calls
+after 'rpc' => sub {
+    my $s = shift;
+    my $i = $s->api_call_count;
+    $s->api_call_count( $i + 1 );
+};
+
+# specific for login
+sub login {
+    my $s = shift;
+    $s->module('empire');
+
+    my $r = $s->rpc( 'login', $s->user, $s->passwd, $s->api_key, );
+    $s->session_id($r->{session_id});
+
+    return $r;
+}
+
+# generic for everything else
+sub call {
+    my $s = shift;
+    my $module = shift;
+    $s->module($module);
+    $s->rpc(@_);
+} 
+
+##################################################
+# Thin attempt at syntactic sugar for the deep non OO h-o-h return sets
+package Lacuna::Expanse::API::Results;
+use Data::AsObject 'dao';
+
+sub oo {
+    return dao( $_[0] );
+} 
+
+##################################################
+# a trivial interface for database loading
+package Lacuna::Expanse::DB;
+use Modern::Perl;
+use Moose;
+use DBI;
+use Try::Tiny;
+use YAML;
+
+has file => (
+    is => 'rw',
+    isa => 'Str',
+    default => "data/lacuna.db",
+);
+
+has dsn => (
+    is => 'rw',
+    isa => 'Str',
+    default => sub { my $s = shift; "dbi:SQLite:dbname=".$s->file }
+);
+
+has debug => (
+    is => 'rw',
+    isa => 'Int',
+    default => 0,
+);
+
+has dbh => (
+    is => 'ro',
+    isa => 'DBI::db',
+    default => sub {
+        my $s = shift;
+        DBI->connect(
+            $s->dsn, '', '',
+            { RaiseError => 1, PrintError => 0, AutoCommit => 0 },
+        );
+    },
+    lazy => 1,
+);
+
+# Make a guess at the data type
+sub _type {
+    my $d = shift;
+
+
+    given ($d) {
+        return 'integer' when (not defined $d);
+        return 'integer' when (/^\d+$/);
+        return 'numeric' when (/^[\deE+-]+$/);
+        return 'text';
+    } 
+} 
+
+sub create {
+    my $s = shift;
+    my $table = shift;
+    my $h = shift; 
+    
+    $h->{id} = undef unless (exists $h->{id});
+
+    my @cols = keys %$h;
+    my %types = map {( $_ => _type($h->{$_}) )} @cols;
+    $types{id} .= " primary key";
+
+    my $sql = join " ",
+        'create table if not exists',
+        $table,
+        '(',
+            join (", ", map{"$_ $types{$_}"} @cols),
+        ')';
+
+    my $dbh = $s->dbh;
+
+    $dbh->do($sql);
+    $dbh->commit;
+} 
+
+# get the names of the current columns.
+sub columns {
+    my $s = shift;
+    my $table = shift;
+    my @cols; 
+
+    my $sth = $s->dbh->column_info(undef, 'main', $table, '%');
+    while( my $r = $sth->fetchrow_hashref ) {
+        push @cols, $r->{COLUMN_NAME};
+    }
+
+    return @cols;
+} 
+
+# When we find new attributes we recreate the table and migrate the data.
+sub reorganize_table {
+    my $s = shift;
+    my $table = shift;
+    my $hash = shift;
+
+    my @c = $s->columns($table);
+    my $clist = join ", ", @c;
+    my $dbh = $s->dbh;
+
+    $dbh->do("create temp table tmp_$table as select * from $table");
+    $dbh->do("drop table $table");
+    $s->create($table => $hash);
+    $dbh->do(" insert into $table ( $clist )
+        select $clist from tmp_$table ");
+} 
+
+sub insert_row {
+    my $s = shift;
+    my $table = shift;
+    my $hash = shift;
+
+    my @keys   = keys %$hash;
+    my @values = values %$hash;
+
+    my $sql = join " ",
+        'insert or replace into',
+        $table,
+        '(',
+            join (', ', @keys ),
+        ') values (',
+            join (', ', ('?') x @keys),
+        ')';
+
+    my $dbh = $s->dbh;
+    try {
+        $dbh->do($sql, {}, @values);
+    }
+    catch {
+        $s->reorganize_table($table => $hash);
+        $dbh->do($sql, {}, @values);
+    } 
+} 
+
+sub store {
+    my $s     = shift;
+    my $table = shift;
+    my $h     = shift;
+
+    my %t = flatten_hash(%$h);
+    say Dump \%t if $s->debug;
+
+    $s->create($table => {%t});
+    $s->insert_row($table => {%t});
+    $s->dbh->commit;
+} 
+
+# find and return a hash of just the top level elements
+sub flatten_hash {
+    my %h = @_;
+
+    my @key = grep { not ref $h{$_} } keys( %h );
+    my %t;
+    @t{@key} = @h{@key};
+    return %t;
+} 
+##################################################
+package main;
+use YAML;
+use perl5i::2;
+
+my $lacuna = Lacuna::Expanse::API->new();
+my $result = $lacuna->login->oo;
+my %planets = %{$result->status->empire->planets};
+
+my $home_id = (%planets->keys)[0];
+say "home: ", $home_id;
+
+my $buildings = $lacuna->call(body => get_buildings => $home_id )
+              ->oo
+              ->buildings;
+
+# find the observatory
+my $observatory_id = do {
+    my ($id, $value);
+    while (($id, $value) = each(%$buildings)) {
+        next unless ($value->{name} eq 'Observatory');
+        last;
+    } 
+    $id;
+};
+
+say "observatory: ", $observatory_id;
+# store probed data in a database
+my $probed = $lacuna->call(observatory => get_probed_stars => $observatory_id);
+
+my $db = Lacuna::Expanse::DB->new(debug => 1);
+
+my $ore_id = 0;  # used in the database
+for my $s (@{ $probed->{stars} }) {
+
+    # Store star details
+    $db->store(star => { flatten_hash(%$s) });
+
+    for my $p (@{ $s->{bodies} }) {
+
+        # Store the body details
+        $db->store(body => { flatten_hash(%$p) });
+
+        # Store the ore details
+        my %ore = %{$p->{ore}};
+        $ore{body_id} = $p->{id};
+        $ore{id} = $ore_id++;
+
+        $db->store(ore => { flatten_hash(%ore) });
+
+
+    } 
+} 
+
+say "RPC Call Count: ", $lacuna->api_call_count;
+
+# find and return a hash of just the top level elements
+sub flatten_hash {
+    my %h = @_;
+
+    my @key = grep { not ref $h{$_} } keys( %h );
+    my %t;
+    @t{@key} = @h{@key};
+    return %t;
+} 

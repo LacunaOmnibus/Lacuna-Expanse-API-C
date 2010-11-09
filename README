@@ -1,0 +1,4 @@
+At this point this code is mostly a sketch for future work.
+Moose based api calling the JSON-RPC interface to the Lacuna Expanse MMO.
+and an idea of a persistance model that uses SQLite to store state.
+
